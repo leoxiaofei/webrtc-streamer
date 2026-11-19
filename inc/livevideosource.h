@@ -46,7 +46,7 @@ public:
     LiveVideoSource(const std::string &uri, const std::map<std::string, std::string> &opts, std::unique_ptr<webrtc::VideoDecoderFactory>& videoDecoderFactory, bool wait) :
 	    VideoDecoder(opts, videoDecoderFactory, wait),
         m_env(),
-	    m_liveclient(m_env, this, uri.c_str(), opts, webrtc::GetLoggingConfig().debug_severity() <=2) {
+	    m_liveclient(m_env, this, uri.c_str(), opts, webrtc::GetLoggingConfig().debug_severity() <= 2 ? 2 : 0) {
             m_liveclient.start();
             this->Start();
     }
@@ -297,10 +297,17 @@ public:
         return res;
     }
 
-    bool onData(const char *id, unsigned char *buffer, ssize_t size, struct timeval presentationTime) override
+    // timestamp in ms given to the frames, derived from the source presentation time
+    virtual uint64_t presentationTimestamp(struct timeval presentationTime)
     {
         int64_t ts = presentationTime.tv_sec;
         ts = ts * 1000 + presentationTime.tv_usec / 1000;
+        return ts;
+    }
+
+    bool onData(const char *id, unsigned char *buffer, ssize_t size, struct timeval presentationTime) override
+    {
+        int64_t ts = this->presentationTimestamp(presentationTime);
         RTC_LOG(LS_VERBOSE) << "LiveVideoSource:onData id:" << id << " size:" << size << " ts:" << ts;
         int res = 0;
 
@@ -342,5 +349,6 @@ private:
     std::vector<uint8_t>               m_cfg;
     std::map<std::string, std::string> m_codec;
 
+protected:
     uint64_t                           m_prevTimestamp;
 };

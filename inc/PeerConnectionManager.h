@@ -32,6 +32,10 @@
 
 #include "HttpServerRequestHandler.h"
 
+#ifdef HAVE_LIVE555
+#include "rtspplayback.h"
+#endif
+
 class PeerConnectionManager {
 	class VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 		public:
@@ -159,6 +163,25 @@ class PeerConnectionManager {
 			PeerConnectionStatsCollectorCallback() : m_bytesSent(0), m_bytesReceived(0), m_bwSentBps(0), m_bwRecvBps(0), m_prevBytesSent(0), m_prevBytesReceived(0), m_prevTimestampUs(0) {}
 			void clearReport() { std::lock_guard<std::mutex> lock(m_reportMutex); m_report.clear(); m_bytesSent = 0; m_bytesReceived = 0; m_bwSentBps = 0; m_bwRecvBps = 0; m_prevBytesSent = 0; m_prevBytesReceived = 0; m_prevTimestampUs = 0; }
 			Json::Value getReport() { std::lock_guard<std::mutex> lock(m_reportMutex); return m_report; }
+			// outbound video stats (sent resolution and quality limitation reason)
+			Json::Value getVideoSenderStats() {
+				std::lock_guard<std::mutex> lock(m_reportMutex);
+				Json::Value stats(Json::arrayValue);
+				for (const auto & it : m_report.getMemberNames())
+				{
+					const Json::Value & entry = m_report[it];
+					if ( (entry.get("__type","").asString() == "outbound-rtp") && entry.isMember("frameWidth") )
+					{
+						Json::Value video;
+						video["frameWidth"]            = entry.get("frameWidth", 0);
+						video["frameHeight"]           = entry.get("frameHeight", 0);
+						video["framesEncoded"]         = entry.get("framesEncoded", 0);
+						video["qualityLimitationReason"] = entry.get("qualityLimitationReason", "");
+						stats.append(video);
+					}
+				}
+				return stats;
+			}
 			uint64_t getBytesSent()          { std::lock_guard<std::mutex> lock(m_reportMutex); return m_bytesSent; }
 			uint64_t getBytesReceived()      { std::lock_guard<std::mutex> lock(m_reportMutex); return m_bytesReceived; }
 			uint64_t getBandwidthSentBps()   { std::lock_guard<std::mutex> lock(m_reportMutex); return m_bwSentBps; }
@@ -171,6 +194,7 @@ class PeerConnectionManager {
 				uint64_t bytesReceived = 0;
 				for (const webrtc::RTCStats& stats : *report) {
 					Json::Value statsMembers;
+					statsMembers["__type"] = std::string(stats.type());
 					for (auto & attribute : stats.Attributes()) {
 						statsMembers[attribute.name()] = attribute.ToString();
 					}
@@ -215,9 +239,10 @@ class PeerConnectionManager {
 
 	class DataChannelObserver : public webrtc::DataChannelObserver  {
 		public:
-			DataChannelObserver(webrtc::scoped_refptr<webrtc::DataChannelInterface> dataChannel): m_dataChannel(dataChannel) {
+			DataChannelObserver(PeerConnectionManager* peerConnectionManager, const std::string& peerid, webrtc::scoped_refptr<webrtc::DataChannelInterface> dataChannel)
+				: m_peerConnectionManager(peerConnectionManager), m_peerid(peerid), m_dataChannel(dataChannel) {
 				m_dataChannel->RegisterObserver(this);
-			
+
 			}
 			virtual ~DataChannelObserver() {
 				m_dataChannel->UnregisterObserver();
@@ -230,12 +255,18 @@ class PeerConnectionManager {
 				webrtc::DataBuffer buffer(msg);
 				m_dataChannel->Send(buffer);
 			}
-			virtual void OnMessage(const webrtc::DataBuffer& buffer) {
-				std::string msg((const char*)buffer.data.data(),buffer.data.size());
-				RTC_LOG(LS_ERROR) << __PRETTY_FUNCTION__ << " channel:" << m_dataChannel->label() << " msg:" << msg;
-			}
+			virtual void OnMessage(const webrtc::DataBuffer& buffer);
 
 		protected:
+			void sendAnswer(const Json::Value& answer) {
+				if (m_dataChannel->state() == webrtc::DataChannelInterface::DataState::kOpen) {
+					webrtc::DataBuffer buffer(Json::writeString(Json::StreamWriterBuilder(), answer));
+					m_dataChannel->Send(buffer);
+				}
+			}
+
+			PeerConnectionManager*                                 m_peerConnectionManager;
+			std::string                                            m_peerid;
 			webrtc::scoped_refptr<webrtc::DataChannelInterface>    m_dataChannel;
 	};
 
@@ -257,7 +288,7 @@ class PeerConnectionManager {
 
 					webrtc::RTCErrorOr<webrtc::scoped_refptr<webrtc::DataChannelInterface>>  errorOrChannel = m_pc->CreateDataChannelOrError("ServerDataChannel", NULL);
 					if (errorOrChannel.ok()) {
-						m_localChannel.reset(new DataChannelObserver(errorOrChannel.MoveValue()));
+						m_localChannel.reset(new DataChannelObserver(m_peerConnectionManager, m_peerid, errorOrChannel.MoveValue()));
 					} else {
 						RTC_LOG(LS_ERROR) << __FUNCTION__ << "CreateDataChannel peerid:" << peerid << " error:" << errorOrChannel.error().message();
 					}
@@ -290,6 +321,7 @@ class PeerConnectionManager {
 			uint64_t getBytesReceived()      { return m_statsCallback->getBytesReceived(); }
 			uint64_t getBandwidthSentBps()   { return m_statsCallback->getBandwidthSentBps(); }
 			uint64_t getBandwidthRecvBps()   { return m_statsCallback->getBandwidthRecvBps(); }
+			Json::Value getVideoSenderStats() { return m_statsCallback->getVideoSenderStats(); }
 			
 			Json::Value getStats() {
 				m_statsCallback->clearReport();
@@ -323,7 +355,7 @@ class PeerConnectionManager {
 			}
 			virtual void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) {
 				RTC_LOG(LS_ERROR) << __PRETTY_FUNCTION__;
-				m_remoteChannel.reset(new DataChannelObserver(channel));
+				m_remoteChannel.reset(new DataChannelObserver(m_peerConnectionManager, m_peerid, channel));
 			}
 			virtual void OnRenegotiationNeeded()                              {
 				RTC_LOG(LS_ERROR) << __PRETTY_FUNCTION__ << " peerid:" << m_peerid;;
@@ -377,7 +409,7 @@ class PeerConnectionManager {
 	};
 
 	public:
-		PeerConnectionManager(const std::list<std::string> & iceServerList, const Json::Value & config, webrtc::AudioDeviceModule::AudioLayer audioLayer, const std::string& publishFilter, const std::string& webrtcUdpPortRange, bool useNullCodec, bool usePlanB, int maxpc, webrtc::PeerConnectionInterface::IceTransportsType transportType, const std::string & basePath, const std::string & webrtcTrialsFields, const std::string & extraHost = "");
+		PeerConnectionManager(const std::list<std::string> & iceServerList, const Json::Value & config, webrtc::AudioDeviceModule::AudioLayer audioLayer, const std::string& publishFilter, const std::string& webrtcUdpPortRange, bool useNullCodec, bool usePlanB, int maxpc, int rtspCloseDelay, webrtc::PeerConnectionInterface::IceTransportsType transportType, const std::string & basePath, const std::string & webrtcTrialsFields, const std::string & extraHost = "");
 		virtual ~PeerConnectionManager();
 
 		bool InitializePeerConnection();
@@ -396,8 +428,26 @@ class PeerConnectionManager {
 		const Json::Value getStreamList();
 		const Json::Value createOffer(const std::string &peerid, const std::string & videourl, const std::string & audiourl, const std::string & options);
 		const Json::Value setAnswer(const std::string &peerid, const Json::Value& jmessage);
+		const Json::Value setSpeed(const std::string &peerid, double rate);
+		const Json::Value seek(const std::string &peerid, double time);
+		const Json::Value pause(const std::string &peerid);
+		const Json::Value resume(const std::string &peerid);
+		const Json::Value getProgress(const std::string &peerid);
 		std::tuple<int,std::map<std::string,std::string>,Json::Value> whep( const std::string &method,  const std::string &url,  const std::string &peerid, const std::string & videourl, const std::string & audiourl, const std::string & options, bool useNullCodec, const Json::Value &in);
 
+
+		// a stream shared by the peer connections watching the same url+options
+		struct StreamEntry {
+			webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> videoSource;
+			webrtc::scoped_refptr<webrtc::AudioSourceInterface> audioSource;
+#ifdef HAVE_LIVE555
+			// playback controls of rtsp sources, valid while the sources are alive
+			RTSPPlayback* playbackVideo = nullptr;
+			RTSPPlayback* playbackAudio = nullptr;
+#endif
+			// delay in seconds before closing the rtsp connection when the last client hangs up (-1: use global default)
+			int closeDelay = -1;
+		};
 
 	protected:
 		PeerConnectionObserver*                               CreatePeerConnection(const std::string& peerid, bool useNullCodec = false);
@@ -405,6 +455,9 @@ class PeerConnectionManager {
 		webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> CreateVideoSource(const std::string & videourl, const std::map<std::string,std::string> & opts, bool useNullCodec = false);
 		webrtc::scoped_refptr<webrtc::AudioSourceInterface>      CreateAudioSource(const std::string & audiourl, const std::map<std::string,std::string> & opts, const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> & peerConnectionFactory);
 		bool                                                  streamStillUsed(const std::string & streamLabel);
+		bool                                                  getStreamLabel(const std::string &peerid, std::string & streamLabel);
+		bool                                                  getStreamEntry(const std::string & streamLabel, StreamEntry & entry);
+		void                                                  eraseStream(const std::string & streamLabel);
 		const std::list<std::string>                          getVideoCaptureDeviceList();
 		webrtc::scoped_refptr<webrtc::PeerConnectionInterface>   getPeerConnection(const std::string& peerid);
 		const std::string                                     sanitizeLabel(const std::string &label);
@@ -415,9 +468,8 @@ class PeerConnectionManager {
 
 
 	protected:
-		const webrtc::Environment                                                    m_webrtcenv;	
+		const webrtc::Environment                                                    m_webrtcenv;
 		std::unique_ptr<webrtc::Thread>                                              m_signalingThread;
-		typedef std::pair< webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface>, webrtc::scoped_refptr<webrtc::AudioSourceInterface>> AudioVideoPair;
 		webrtc::scoped_refptr<webrtc::AudioDecoderFactory>                           m_audioDecoderfactory;
 		webrtc::scoped_refptr<webrtc::AudioDeviceModule>                             m_audioDeviceModule;
 	  	std::unique_ptr<webrtc::VideoDecoderFactory>                                 m_builtin_video_decoder_factory;
@@ -426,7 +478,7 @@ class PeerConnectionManager {
 		webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>                m_null_peer_connection_factory;
 		std::mutex                                                                   m_peerMapMutex;
 		std::map<std::string, std::unique_ptr<PeerConnectionObserver>>               m_peer_connectionobs_map;
-		std::map<std::string, AudioVideoPair>                                        m_stream_map;
+		std::map<std::string, StreamEntry>                                           m_stream_map;
 		std::mutex                                                                   m_streamMapMutex;
 		std::list<std::string>                                                       m_iceServerList;
 		const Json::Value                                                            m_config;
@@ -437,6 +489,7 @@ class PeerConnectionManager {
 		bool                                                                         m_useNullCodec;
 		bool                                                                         m_usePlanB;
 		int                                                                          m_maxpc;
+		int                                                                          m_rtspCloseDelay;
 		webrtc::PeerConnectionInterface::IceTransportsType                           m_transportType;
 		const std::string                                                            m_webrtcTrialsFields;
 		const std::string                                                            m_extraHost;

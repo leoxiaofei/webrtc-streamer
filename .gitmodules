@@ -1,12 +1,12 @@
 [submodule "live555helper"]
 	path = live555helper
-	url = https://github.com/mpromonet/live555helper
+	url = https://github.com/leoxiaofei/live555helper.git
 [submodule "civetweb"]
 	path = civetweb
 	url = https://github.com/civetweb/civetweb
 [submodule "html"]
 	path = html
-	url = https://github.com/mpromonet/webrtc-streamer-html
+	url = https://github.com/leoxiaofei/webrtc-streamer-html.git
 [submodule "prometheus-cpp"]
 	path = prometheus-cpp
 	url = https://github.com/jupp0r/prometheus-cpp

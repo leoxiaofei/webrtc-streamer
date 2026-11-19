@@ -62,6 +62,9 @@ public:
 		return result;
 	}
 
+	// access the capturer (e.g. to drive playback controls)
+	T* GetCapturer() const { return m_capturer.get(); }
+
 
 protected:
 	explicit TrackSource(std::unique_ptr<T> capturer)
@@ -77,6 +80,31 @@ private:
 	}
 	std::unique_ptr<T> m_capturer;
 };
+
+#ifdef HAVE_LIVE555
+/* ---------------------------------------------------------------------------
+**  Audio+video track source demuxing both medias of a single rtsp connection
+** -------------------------------------------------------------------------*/
+class AVTrackSource : public TrackSource<RTSPVideoCapturer> {
+public:
+	static webrtc::scoped_refptr<AVTrackSource> Create(const std::string & videourl, const std::map<std::string, std::string> & opts, std::unique_ptr<webrtc::VideoDecoderFactory>& videoDecoderFactory, webrtc::scoped_refptr<webrtc::AudioDecoderFactory> audioDecoderFactory) {
+		std::unique_ptr<RTSPVideoCapturer> capturer = absl::WrapUnique(RTSPVideoCapturer::Create(videourl, opts, videoDecoderFactory, audioDecoderFactory));
+		if (!capturer) {
+			return nullptr;
+		}
+		return webrtc::make_ref_counted<AVTrackSource>(std::move(capturer));
+	}
+
+	// audio source fed by the audio tracks of the connection
+	webrtc::scoped_refptr<webrtc::AudioSourceInterface> GetAudioSource() const {
+		return GetCapturer() ? GetCapturer()->audioSource() : nullptr;
+	}
+
+protected:
+	explicit AVTrackSource(std::unique_ptr<RTSPVideoCapturer> capturer)
+		: TrackSource<RTSPVideoCapturer>(std::move(capturer)) {}
+};
+#endif
 
 class CapturerFactory {
 	public:

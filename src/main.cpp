@@ -129,6 +129,7 @@ int main(int argc, char *argv[])
 	bool useNullCodec = false;
 	bool usePlanB = false;
 	int maxpc = 0;
+	int rtspCloseDelay = 0;
 	webrtc::PeerConnectionInterface::IceTransportsType transportType = webrtc::PeerConnectionInterface::IceTransportsType::kAll;
 	std::string webrtcTrialsFields = "WebRTC-FrameDropper/Disabled/WebRTC-Video-H26xPacketBuffer/Enabled/";
 	TurnAuth turnAuth;
@@ -157,6 +158,7 @@ int main(int argc, char *argv[])
 			("n,name", "Register a stream with name", cxxopts::value<std::string>())
 			("u,video", "Video URL for the named stream", cxxopts::value<std::string>())
 			("U,audio", "Audio URL for the named stream", cxxopts::value<std::string>())
+			("k,rtsp-close-delay", "Delay in seconds before closing the RTSP connection when the last WebRTC client hangs up (default: 0)", cxxopts::value<int>())
 			("urls", "URLs to register in the source list", cxxopts::value<std::vector<std::string>>());
 
 		options.add_options("HTTP")
@@ -273,6 +275,11 @@ int main(int argc, char *argv[])
 			maxpc = result["maxpc"].as<int>();
 		}
 
+		if (result.count("rtsp-close-delay"))
+		{
+			rtspCloseDelay = result["rtsp-close-delay"].as<int>();
+		}
+
 		if (result.count("ice-transport"))
 		{
 			transportType = (webrtc::PeerConnectionInterface::IceTransportsType)result["ice-transport"].as<int>();
@@ -385,7 +392,7 @@ int main(int argc, char *argv[])
 		iceServerList.push_back(std::string("turn:") + turnurl);
 	}
 
-	webRtcServer = new PeerConnectionManager(iceServerList, config["urls"], audioLayer, publishFilter, localWebrtcUdpPortRange, useNullCodec, usePlanB, maxpc, transportType, basePath, webrtcTrialsFields, extraHost);
+	webRtcServer = new PeerConnectionManager(iceServerList, config["urls"], audioLayer, publishFilter, localWebrtcUdpPortRange, useNullCodec, usePlanB, maxpc, rtspCloseDelay, transportType, basePath, webrtcTrialsFields, extraHost);
 	if (!webRtcServer->InitializePeerConnection())
 	{
 		std::cout << "Cannot Initialize WebRTC server" << std::endl;

@@ -23,9 +23,10 @@ class VideoScaler :  public webrtc::VideoSinkInterface<webrtc::VideoFrame>,  pub
 public:
 
     VideoScaler(const std::map<std::string, std::string> &opts) :
-                m_width(0), m_height(0), 
+                m_width(0), m_height(0),
                 m_rotation(webrtc::kVideoRotation_0),
-                m_roi_x(0), m_roi_y(0), m_roi_width(0), m_roi_height(0) 
+                m_roi_x(0), m_roi_y(0), m_roi_width(0), m_roi_height(0),
+                m_lastWidth(0), m_lastHeight(0)
     {
         if (opts.find("width") != opts.end())
         {
@@ -86,27 +87,30 @@ public:
     {
     }
 
-    webrtc::scoped_refptr<webrtc::I420Buffer> createOutputBuffer() {
+    webrtc::scoped_refptr<webrtc::I420Buffer> createOutputBuffer(int roi_width, int roi_height) {
         int height = m_height;
         int width = m_width;
         if ( (height == 0) && (width == 0) )
         {
-            height = m_roi_height;
-            width = m_roi_width;
+            height = roi_height;
+            width = roi_width;
         }
         else if (height == 0)
         {
-            height = (m_roi_height * width) / m_roi_width;
+            height = (roi_height * width) / roi_width;
         }
         else if (width == 0)
         {
-            width = (m_roi_width * height) / m_roi_height;
+            width = (roi_width * height) / roi_height;
         }
         return webrtc::I420Buffer::Create(width, height);
     }
 
     void OnFrame(const webrtc::VideoFrame &frame) override
     {
+        m_lastWidth = frame.width();
+        m_lastHeight = frame.height();
+
         if ((m_roi_x != 0) && (m_roi_x >= frame.width()))
         {
             RTC_LOG(LS_WARNING) << "The ROI position protrudes beyond the right edge of the image. Ignore roi_x.";
@@ -128,33 +132,29 @@ public:
             m_roi_height = 0;
         }
 
-        if (m_roi_width == 0)
-        {
-            m_roi_width = frame.width() - m_roi_x;
-        }
-        if (m_roi_height == 0)
-        {
-            m_roi_height = frame.height() - m_roi_y;
-        }
+        // the roi size follows the frame size unless it is explicitly configured,
+        // caching it would crop the image when the source resolution changes
+        int roi_width = (m_roi_width != 0) ? m_roi_width : frame.width() - m_roi_x;
+        int roi_height = (m_roi_height != 0) ? m_roi_height : frame.height() - m_roi_y;
 
-        if ( ((m_roi_width != frame.width()) && (m_roi_height == frame.height()) && (m_rotation == webrtc::kVideoRotation_0)) || (frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kNative) )
+        if ( ((roi_width != frame.width()) && (roi_height == frame.height()) && (m_rotation == webrtc::kVideoRotation_0)) || (frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kNative) )
         {
             m_broadcaster.OnFrame(frame);
         }
         else
         {
-            webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer = this->createOutputBuffer();
-            if (m_roi_width != frame.width() || m_roi_height != frame.height())
+            webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer = this->createOutputBuffer(roi_width, roi_height);
+            if (roi_width != frame.width() || roi_height != frame.height())
             {
-                RTC_LOG(LS_VERBOSE) << "crop:" << m_roi_x << "x" << m_roi_y << " " << m_roi_width << "x" << m_roi_height << " scale: " << scaled_buffer->width() << "x" << scaled_buffer->height();
-                scaled_buffer->CropAndScaleFrom(*frame.video_frame_buffer()->ToI420(), m_roi_x, m_roi_y, m_roi_width, m_roi_height);
+                RTC_LOG(LS_VERBOSE) << "crop:" << m_roi_x << "x" << m_roi_y << " " << roi_width << "x" << roi_height << " scale: " << scaled_buffer->width() << "x" << scaled_buffer->height();
+                scaled_buffer->CropAndScaleFrom(*frame.video_frame_buffer()->ToI420(), m_roi_x, m_roi_y, roi_width, roi_height);
             }
             else
             {
                 RTC_LOG(LS_VERBOSE) << "scale: " << scaled_buffer->width() << "x" << scaled_buffer->height();
                 scaled_buffer->ScaleFrom(*frame.video_frame_buffer()->ToI420());
             }
-            
+
             webrtc::VideoFrame scaledFrame = webrtc::VideoFrame::Builder()
                 .set_video_frame_buffer(scaled_buffer)
                 .set_rotation(m_rotation)
@@ -167,8 +167,8 @@ public:
         }
     }
 
-    int width() const { return m_roi_width;  }
-    int height() const { return m_roi_height;  }
+    int width() const { return m_lastWidth;  }
+    int height() const { return m_lastHeight; }
 
 private:
     int                    m_width;
@@ -177,6 +177,8 @@ private:
     int                    m_roi_x;
     int                    m_roi_y;
     int                    m_roi_width;
-    int                    m_roi_height;    
+    int                    m_roi_height;
+    int                    m_lastWidth;
+    int                    m_lastHeight;
 };
 

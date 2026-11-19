@@ -19,8 +19,9 @@
 #include "rtspaudiocapturer.h"
 
 
-RTSPAudioSource::RTSPAudioSource(webrtc::scoped_refptr<webrtc::AudioDecoderFactory> audioDecoderFactory, const std::string & uri, const std::map<std::string,std::string> & opts) 
-				: LiveAudioSource(audioDecoderFactory, uri, opts, false) {
+RTSPAudioSource::RTSPAudioSource(webrtc::scoped_refptr<webrtc::AudioDecoderFactory> audioDecoderFactory, const std::string & uri, const std::map<std::string,std::string> & opts)
+				: LiveAudioSource(audioDecoderFactory, uri, opts, false)
+				, RTSPPlayback(uri) {
 }
 
 RTSPAudioSource::~RTSPAudioSource()  {

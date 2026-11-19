@@ -255,7 +255,7 @@ std::string getOptionValue(const std::string &options, const std::string &option
 /* ---------------------------------------------------------------------------
 **  Constructor
 ** -------------------------------------------------------------------------*/
-PeerConnectionManager::PeerConnectionManager(const std::list<std::string> &iceServerList, const Json::Value & config, const webrtc::AudioDeviceModule::AudioLayer audioLayer, const std::string &publishFilter, const std::string & webrtcUdpPortRange, bool useNullCodec, bool usePlanB, int maxpc, webrtc::PeerConnectionInterface::IceTransportsType transportType, const std::string & basePath, const std::string & webrtcTrialsFields, const std::string & extraHost)
+PeerConnectionManager::PeerConnectionManager(const std::list<std::string> &iceServerList, const Json::Value & config, const webrtc::AudioDeviceModule::AudioLayer audioLayer, const std::string &publishFilter, const std::string & webrtcUdpPortRange, bool useNullCodec, bool usePlanB, int maxpc, int rtspCloseDelay, webrtc::PeerConnectionInterface::IceTransportsType transportType, const std::string & basePath, const std::string & webrtcTrialsFields, const std::string & extraHost)
 	: m_webrtcenv(webrtc::CreateEnvironment(webrtc::FieldTrials::Create(webrtcTrialsFields))),
 	  m_signalingThread(webrtc::Thread::Create()),
 	  m_audioDecoderfactory(webrtc::CreateBuiltinAudioDecoderFactory()), 
@@ -268,6 +268,7 @@ PeerConnectionManager::PeerConnectionManager(const std::list<std::string> &iceSe
 	  m_useNullCodec(useNullCodec), 
 	  m_usePlanB(usePlanB),
 	  m_maxpc(maxpc),
+	  m_rtspCloseDelay(rtspCloseDelay),
 	  m_transportType(transportType),
 	  m_webrtcTrialsFields(webrtcTrialsFields),
 	  m_extraHost(resolveHostnameToIp(extraHost))
@@ -354,6 +355,33 @@ PeerConnectionManager::PeerConnectionManager(const std::list<std::string> &iceSe
 	m_func[basePath + "/api/getIceCandidate"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
 		std::string peerid   = getParam(req_info->query_string, "peerid");
 		return std::make_tuple(200, std::map<std::string,std::string>(),this->getIceCandidateList(peerid));
+	};
+
+	m_func[basePath + "/api/speed"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
+		std::string peerid = getParam(req_info->query_string, "peerid");
+		std::string rate   = getParam(req_info->query_string, "rate");
+		return std::make_tuple(200, std::map<std::string,std::string>(),this->setSpeed(peerid, atof(rate.c_str())));
+	};
+
+	m_func[basePath + "/api/seek"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
+		std::string peerid = getParam(req_info->query_string, "peerid");
+		std::string time   = getParam(req_info->query_string, "time");
+		return std::make_tuple(200, std::map<std::string,std::string>(),this->seek(peerid, atof(time.c_str())));
+	};
+
+	m_func[basePath + "/api/pause"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
+		std::string peerid = getParam(req_info->query_string, "peerid");
+		return std::make_tuple(200, std::map<std::string,std::string>(),this->pause(peerid));
+	};
+
+	m_func[basePath + "/api/resume"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
+		std::string peerid = getParam(req_info->query_string, "peerid");
+		return std::make_tuple(200, std::map<std::string,std::string>(),this->resume(peerid));
+	};
+
+	m_func[basePath + "/api/progress"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
+		std::string peerid = getParam(req_info->query_string, "peerid");
+		return std::make_tuple(200, std::map<std::string,std::string>(),this->getProgress(peerid));
 	};
 
 	m_func[basePath + "/api/addIceCandidate"] = [this](const struct mg_request_info *req_info, const Json::Value &in) -> HttpServerRequestHandler::httpFunctionReturn {
@@ -1019,15 +1047,37 @@ const Json::Value PeerConnectionManager::hangUp(const std::string &peerid)
 				bool stillUsed = this->streamStillUsed(streamLabel);
 				if (!stillUsed)
 				{
-					RTC_LOG(LS_ERROR) << "hangUp stream is no more used " << streamLabel;
-					std::lock_guard<std::mutex> mlock(m_streamMapMutex);
-					std::map<std::string, std::pair<webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface>, webrtc::scoped_refptr<webrtc::AudioSourceInterface>>>::iterator it = m_stream_map.find(streamLabel);
-					if (it != m_stream_map.end())
+					// resolve the delay before closing the rtsp connection (per stream override, or global default)
+					int closeDelay = m_rtspCloseDelay;
 					{
-						m_stream_map.erase(it);
+						std::lock_guard<std::mutex> mlock(m_streamMapMutex);
+						std::map<std::string, StreamEntry>::iterator it = m_stream_map.find(streamLabel);
+						if ( (it != m_stream_map.end()) && (it->second.closeDelay >= 0) )
+						{
+							closeDelay = it->second.closeDelay;
+						}
 					}
 
-					RTC_LOG(LS_ERROR) << "hangUp stream closed " << streamLabel;
+					if (closeDelay <= 0)
+					{
+						RTC_LOG(LS_ERROR) << "hangUp stream is no more used " << streamLabel;
+						this->eraseStream(streamLabel);
+						RTC_LOG(LS_ERROR) << "hangUp stream closed " << streamLabel;
+					}
+					else
+					{
+						// delay the close of the rtsp connection to avoid tearing it down
+						// and re-opening it if a client comes back within the delay
+						RTC_LOG(LS_INFO) << "hangUp stream is no more used " << streamLabel << " closing in " << closeDelay << "s";
+						m_signalingThread->PostDelayedTask([this, streamLabel, closeDelay]() {
+							// a new client may have started using the stream during the delay
+							if (!this->streamStillUsed(streamLabel))
+							{
+								RTC_LOG(LS_INFO) << "closing stream " << streamLabel;
+								this->eraseStream(streamLabel);
+							}
+						}, webrtc::TimeDelta::Seconds(closeDelay));
+					}
 				}
 
 				peerConnection->RemoveTrackOrError(stream);
@@ -1043,6 +1093,277 @@ const Json::Value PeerConnectionManager::hangUp(const std::string &peerid)
 	}
 	RTC_LOG(LS_INFO) << __FUNCTION__ << " " << peerid << " answer:" << answer.toStyledString();
 	return answer;
+}
+
+/* ---------------------------------------------------------------------------
+**  get the stream label used by a PeerConnection
+** -------------------------------------------------------------------------*/
+bool PeerConnectionManager::getStreamLabel(const std::string &peerid, std::string & streamLabel)
+{
+	std::lock_guard<std::mutex> peerlock(m_peerMapMutex);
+	std::map<std::string, std::unique_ptr<PeerConnectionObserver>>::iterator it = m_peer_connectionobs_map.find(peerid);
+	if (it == m_peer_connectionobs_map.end())
+	{
+		return false;
+	}
+
+	webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peerConnection = it->second->getPeerConnection();
+	std::vector<webrtc::scoped_refptr<webrtc::RtpSenderInterface>> localstreams = peerConnection->GetSenders();
+	for (auto stream : localstreams)
+	{
+		std::vector<std::string> streamVector = stream->stream_ids();
+		if (streamVector.size() > 0)
+		{
+			streamLabel = streamVector[0];
+			return true;
+		}
+	}
+	return false;
+}
+
+/* ---------------------------------------------------------------------------
+**  get a copy of a stream entry (the copy holds the sources, keeping the capturers alive)
+** -------------------------------------------------------------------------*/
+bool PeerConnectionManager::getStreamEntry(const std::string &streamLabel, StreamEntry & entry)
+{
+	std::lock_guard<std::mutex> mlock(m_streamMapMutex);
+	std::map<std::string, StreamEntry>::iterator it = m_stream_map.find(streamLabel);
+	if (it == m_stream_map.end())
+	{
+		return false;
+	}
+	entry = it->second;
+	return true;
+}
+
+/* ---------------------------------------------------------------------------
+**  remove a stream from the map (closing the rtsp connection of the capturers)
+** -------------------------------------------------------------------------*/
+void PeerConnectionManager::eraseStream(const std::string &streamLabel)
+{
+	std::lock_guard<std::mutex> mlock(m_streamMapMutex);
+	m_stream_map.erase(streamLabel);
+}
+
+/* ---------------------------------------------------------------------------
+**  change the playback speed of the stream of a PeerConnection
+** -------------------------------------------------------------------------*/
+const Json::Value PeerConnectionManager::setSpeed(const std::string &peerid, double rate)
+{
+	RTC_LOG(LS_INFO) << __FUNCTION__ << " " << peerid << " rate:" << rate;
+
+	Json::Value answer;
+	std::string streamLabel;
+	StreamEntry entry;
+	if ( (rate != 0) && this->getStreamLabel(peerid, streamLabel) && this->getStreamEntry(streamLabel, entry) )
+	{
+#ifdef HAVE_LIVE555
+		if (entry.playbackVideo)
+		{
+			entry.playbackVideo->setScale(static_cast<float>(rate));
+		}
+		if (entry.playbackAudio)
+		{
+			entry.playbackAudio->setScale(static_cast<float>(rate));
+		}
+#endif
+		answer = getProgress(peerid);
+	}
+	else
+	{
+		answer["error"] = "cannot find stream of peer:" + peerid;
+	}
+	return answer;
+}
+
+/* ---------------------------------------------------------------------------
+**  seek the stream of a PeerConnection to a position in seconds
+** -------------------------------------------------------------------------*/
+const Json::Value PeerConnectionManager::seek(const std::string &peerid, double time)
+{
+	RTC_LOG(LS_INFO) << __FUNCTION__ << " " << peerid << " time:" << time;
+
+	Json::Value answer;
+	std::string streamLabel;
+	StreamEntry entry;
+	if ( (time >= 0) && this->getStreamLabel(peerid, streamLabel) && this->getStreamEntry(streamLabel, entry) )
+	{
+#ifdef HAVE_LIVE555
+		if (entry.playbackVideo)
+		{
+			entry.playbackVideo->seek(time);
+		}
+		if (entry.playbackAudio)
+		{
+			entry.playbackAudio->seek(time);
+		}
+#endif
+		answer = getProgress(peerid);
+	}
+	else
+	{
+		answer["error"] = "cannot find stream of peer:" + peerid;
+	}
+	return answer;
+}
+
+/* ---------------------------------------------------------------------------
+**  pause the stream of a PeerConnection (RTSP "PAUSE" command)
+** -------------------------------------------------------------------------*/
+const Json::Value PeerConnectionManager::pause(const std::string &peerid)
+{
+	RTC_LOG(LS_INFO) << __FUNCTION__ << " " << peerid;
+
+	Json::Value answer;
+	std::string streamLabel;
+	StreamEntry entry;
+	if ( this->getStreamLabel(peerid, streamLabel) && this->getStreamEntry(streamLabel, entry) )
+	{
+#ifdef HAVE_LIVE555
+		if (entry.playbackVideo)
+		{
+			entry.playbackVideo->pause();
+		}
+		if (entry.playbackAudio)
+		{
+			entry.playbackAudio->pause();
+		}
+#endif
+		answer = getProgress(peerid);
+	}
+	else
+	{
+		answer["error"] = "cannot find stream of peer:" + peerid;
+	}
+	return answer;
+}
+
+/* ---------------------------------------------------------------------------
+**  resume a paused stream of a PeerConnection (RTSP "PLAY" command)
+** -------------------------------------------------------------------------*/
+const Json::Value PeerConnectionManager::resume(const std::string &peerid)
+{
+	RTC_LOG(LS_INFO) << __FUNCTION__ << " " << peerid;
+
+	Json::Value answer;
+	std::string streamLabel;
+	StreamEntry entry;
+	if ( this->getStreamLabel(peerid, streamLabel) && this->getStreamEntry(streamLabel, entry) )
+	{
+#ifdef HAVE_LIVE555
+		if (entry.playbackVideo)
+		{
+			entry.playbackVideo->resume();
+		}
+		if (entry.playbackAudio)
+		{
+			entry.playbackAudio->resume();
+		}
+#endif
+		answer = getProgress(peerid);
+	}
+	else
+	{
+		answer["error"] = "cannot find stream of peer:" + peerid;
+	}
+	return answer;
+}
+
+/* ---------------------------------------------------------------------------
+**  get the playback state (position, duration, speed) of the stream of a PeerConnection
+** -------------------------------------------------------------------------*/
+const Json::Value PeerConnectionManager::getProgress(const std::string &peerid)
+{
+	RTC_LOG(LS_INFO) << __FUNCTION__ << " " << peerid;
+
+	Json::Value answer;
+	std::string streamLabel;
+	StreamEntry entry;
+	if ( this->getStreamLabel(peerid, streamLabel) && this->getStreamEntry(streamLabel, entry) )
+	{
+#ifdef HAVE_LIVE555
+		RTSPPlayback* playback = entry.playbackVideo ? entry.playbackVideo : entry.playbackAudio;
+		if (playback)
+		{
+			answer["position"]   = playback->position();
+			answer["rangeStart"] = playback->rangeStart();
+			answer["rangeEnd"]   = playback->rangeEnd();
+			answer["duration"]   = playback->duration();
+			answer["scale"]      = playback->scale();
+			answer["seekable"]   = playback->seekable();
+			answer["paused"]     = playback->isPaused();
+
+			// playback speeds supported by the server ("Media-Properties:" answer)
+			std::vector<float> supportedScales = playback->supportedScales();
+			if (!supportedScales.empty())
+			{
+				Json::Value scalesList(Json::arrayValue);
+				for (float scale : supportedScales)
+				{
+					scalesList.append(scale);
+				}
+				answer["scales"] = scalesList;
+			}
+		}
+		else
+#endif
+		{
+			answer["error"] = "stream does not support playback control";
+		}
+	}
+	else
+	{
+		answer["error"] = "cannot find stream of peer:" + peerid;
+	}
+	return answer;
+}
+
+/* ---------------------------------------------------------------------------
+**  handle a control command sent on a data channel:
+**    {"cmd":"speed","value":2.0}   change the playback speed
+**    {"cmd":"seek","value":12.5}   seek to a position in seconds
+**    {"cmd":"progress"}            answer with the playback state
+**  the answer is always the playback state JSON, allowing the client to refresh its UI
+** -------------------------------------------------------------------------*/
+void PeerConnectionManager::DataChannelObserver::OnMessage(const webrtc::DataBuffer& buffer)
+{
+	std::string msg((const char*)buffer.data.data(), buffer.data.size());
+	RTC_LOG(LS_INFO) << __PRETTY_FUNCTION__ << " channel:" << m_dataChannel->label() << " msg:" << msg;
+
+	Json::Value request;
+	std::unique_ptr<Json::CharReader> reader(Json::CharReaderBuilder().newCharReader());
+	std::string errors;
+	if (reader->parse(msg.c_str(), msg.c_str() + msg.size(), &request, &errors) && request.isObject())
+	{
+		std::string cmd = request.get("cmd", "").asString();
+		Json::Value answer;
+		if ( (cmd == "speed") && request.isMember("value") )
+		{
+			answer = m_peerConnectionManager->setSpeed(m_peerid, request["value"].asDouble());
+		}
+		else if ( (cmd == "seek") && request.isMember("value") )
+		{
+			answer = m_peerConnectionManager->seek(m_peerid, request["value"].asDouble());
+		}
+		else if (cmd == "pause")
+		{
+			answer = m_peerConnectionManager->pause(m_peerid);
+		}
+		else if (cmd == "resume")
+		{
+			answer = m_peerConnectionManager->resume(m_peerid);
+		}
+		else if (cmd == "progress")
+		{
+			answer = m_peerConnectionManager->getProgress(m_peerid);
+		}
+		else
+		{
+			RTC_LOG(LS_WARNING) << __PRETTY_FUNCTION__ << " unknown command:" << msg;
+			answer["error"] = "unknown command";
+		}
+		this->sendAnswer(answer);
+	}
 }
 
 /* ---------------------------------------------------------------------------
@@ -1093,8 +1414,9 @@ const Json::Value PeerConnectionManager::getPeerConnectionList()
 			int64_t durationMs = (webrtc::TimeMicros() - it.second->getCreationTime()) / 1000;
 			content["duration_ms"] = (Json::Int64)durationMs;
 
-			it.second->triggerStatsUpdate();
-			content["bytes_sent"]             = (Json::UInt64)it.second->getBytesSent();
+				it.second->triggerStatsUpdate();
+				content["video_sender"]           = it.second->getVideoSenderStats();
+				content["bytes_sent"]             = (Json::UInt64)it.second->getBytesSent();
 			content["bytes_received"]         = (Json::UInt64)it.second->getBytesReceived();
 			content["bandwidth_sent_bps"]     = (Json::UInt64)it.second->getBandwidthSentBps();
 			content["bandwidth_received_bps"] = (Json::UInt64)it.second->getBandwidthRecvBps();			
@@ -1365,6 +1687,21 @@ bool PeerConnectionManager::AddStreams(webrtc::PeerConnectionInterface *peer_con
 		{
 			optcapturer += opts["height"];
 		}
+		if (opts.find("rate") != opts.end())
+		{
+			optcapturer += opts["rate"];
+		}
+		else if (opts.find("scale") != opts.end())
+		{
+			optcapturer += opts["scale"];
+		}
+	}
+
+	// delay before closing the rtsp connection when the last client hangs up
+	int closeDelay = -1;
+	if (opts.find("closewait") != opts.end())
+	{
+		closeDelay = atoi(opts["closewait"].c_str());
 	}
 
 	// compute stream label removing space because SDP use label
@@ -1379,13 +1716,50 @@ bool PeerConnectionManager::AddStreams(webrtc::PeerConnectionInterface *peer_con
 	if (needToCreate)
 	{
 		// create sources outside the lock (expensive operations)
-		webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> videoSource(this->CreateVideoSource(video, opts, useNullCodec));
-		webrtc::scoped_refptr<webrtc::AudioSourceInterface> audioSource(this->CreateAudioSource(audio, opts, peerConnectionFactory));
+		webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> videoSource;
+		webrtc::scoped_refptr<webrtc::AudioSourceInterface> audioSource;
+
+#ifdef HAVE_LIVE555
+		// rtsp source without a distinct audio url: demux audio and video from a single connection
+		if ( ( (video.find("rtsp://") == 0) || (video.find("rtsps://") == 0) ) && (audio.empty() || (audio == video)) )
+		{
+			std::unique_ptr<webrtc::VideoDecoderFactory> &videoDecoderFactory = useNullCodec ? m_null_video_decoder_factory : m_builtin_video_decoder_factory;
+			webrtc::scoped_refptr<AVTrackSource> avSource = AVTrackSource::Create(video, opts, videoDecoderFactory, m_audioDecoderfactory);
+			if (avSource)
+			{
+				videoSource = avSource;
+				audioSource = avSource->GetAudioSource();
+			}
+		}
+#endif
+
+		if (!videoSource)
+		{
+			videoSource = this->CreateVideoSource(video, opts, useNullCodec);
+			audioSource = this->CreateAudioSource(audio, opts, peerConnectionFactory);
+		}
+
+		// fill the stream entry
+		StreamEntry entry;
+		entry.videoSource = videoSource;
+		entry.audioSource = audioSource;
+		entry.closeDelay  = closeDelay;
+#ifdef HAVE_LIVE555
+		// rtsp sources support playback control (seek and speed)
+		if ( (video.find("rtsp://") == 0) || (video.find("rtsps://") == 0) )
+		{
+			entry.playbackVideo = static_cast<TrackSource<RTSPVideoCapturer>*>(videoSource.get())->GetCapturer();
+		}
+		if ( (audio.find("rtsp://") == 0) || (audio.find("rtsps://") == 0) )
+		{
+			entry.playbackAudio = static_cast<RTSPAudioSource*>(audioSource.get());
+		}
+#endif
 		RTC_LOG(LS_INFO) << "Adding Stream to map";
 		std::lock_guard<std::mutex> mlock(m_streamMapMutex);
 		// double-check: another thread may have created it while we were creating sources
 		if (m_stream_map.find(streamLabel) == m_stream_map.end()) {
-			m_stream_map[streamLabel] = std::make_pair(videoSource, audioSource);
+			m_stream_map[streamLabel] = entry;
 		}
 		// else: another thread already inserted it; our sources will be released via refcount
 	}
@@ -1393,11 +1767,11 @@ bool PeerConnectionManager::AddStreams(webrtc::PeerConnectionInterface *peer_con
 	// create a new webrtc stream
 	{
 		std::lock_guard<std::mutex> mlock(m_streamMapMutex);
-		std::map<std::string, std::pair<webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface>, webrtc::scoped_refptr<webrtc::AudioSourceInterface>>>::iterator it = m_stream_map.find(streamLabel);
+		std::map<std::string, StreamEntry>::iterator it = m_stream_map.find(streamLabel);
 		if (it != m_stream_map.end())
 		{
-				std::pair<webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface>, webrtc::scoped_refptr<webrtc::AudioSourceInterface>> pair = it->second;
-				webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> videoSource(pair.first);
+				StreamEntry entry = it->second;
+				webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> videoSource(entry.videoSource);
 				if (!videoSource)
 				{
 					RTC_LOG(LS_ERROR) << "Cannot create capturer video:" << videourl;
@@ -1413,10 +1787,10 @@ bool PeerConnectionManager::AddStreams(webrtc::PeerConnectionInterface *peer_con
 					{
 						RTC_LOG(LS_INFO) << "VideoTrack added to PeerConnection";
 						ret = true;
-					}					
+					}
 				}
 
-				webrtc::scoped_refptr<webrtc::AudioSourceInterface> audioSource(pair.second);
+				webrtc::scoped_refptr<webrtc::AudioSourceInterface> audioSource(entry.audioSource);
 				if (!audioSource)
 				{
 					RTC_LOG(LS_ERROR) << "Cannot create capturer audio:" << audio;

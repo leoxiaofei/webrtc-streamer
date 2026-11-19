@@ -13,12 +13,19 @@
 #ifdef HAVE_LIVE555
 
 #include "rtc_base/logging.h"
+#include "rtc_base/ref_counted_object.h"
 
 #include "rtspvideocapturer.h"
 
-RTSPVideoCapturer::RTSPVideoCapturer(const std::string & uri, const std::map<std::string,std::string> & opts, std::unique_ptr<webrtc::VideoDecoderFactory>& videoDecoderFactory) 
+RTSPVideoCapturer::RTSPVideoCapturer(const std::string & uri, const std::map<std::string,std::string> & opts, std::unique_ptr<webrtc::VideoDecoderFactory>& videoDecoderFactory, webrtc::scoped_refptr<webrtc::AudioDecoderFactory> audioDecoderFactory)
 	: LiveVideoSource(uri, opts, videoDecoderFactory, false)
+	, RTSPPlayback(uri)
 {
+	if (audioDecoderFactory)
+	{
+		// demux the audio tracks of the connection into an audio source
+		m_audioPipe = webrtc::scoped_refptr<AudioPipe>(new webrtc::FinalRefCountedObject<AudioPipe>(audioDecoderFactory, false));
+	}
 	RTC_LOG(LS_INFO) << "RTSPVideoCapturer " << uri ;
 
 }
